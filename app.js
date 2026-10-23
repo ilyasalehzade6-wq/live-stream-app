@@ -4,7 +4,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (window.supabase) {
             dbClient = window.supabase.createClient(
                 "https://adufjdildmvvdyxfwyyu.supabase.co", 
-                "sb_publishable_FjLySgXMkBzoxfG2RTh3vg_NYavRF-0"
+                "sb_publishable_FjLySgXMkBzoxfG2RTh3vg_NYavRF-0" // ⚠️ در صورت امکان، این را با کلید anon جایگزین کنید
             );
         }
     } catch (e) { console.error("خطا در اتصال به سرور:", e); }
@@ -170,7 +170,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 const userCount = Object.keys(state).length;
                 onlineUsersText.innerText = `👥 ${userCount} نفر آنلاین`;
             })
-            .subscribe(async (status) => {
+            .subscribe(async (status, err) => {
+                console.log("Realtime Status:", status, err);
                 if (status === 'SUBSCRIBED') {
                     await roomChannel.track({ user: currentUser, online_at: new Date().toISOString() });
 
