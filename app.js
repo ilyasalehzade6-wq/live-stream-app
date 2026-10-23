@@ -4,7 +4,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (window.supabase) {
             dbClient = window.supabase.createClient(
                 "https://adufjdildmvvdyxfwyyu.supabase.co", 
-                "sb_publishable_FjLySgXMkBzoxfG2RTh3vg_NYavRF-0" // ⚠️ در صورت امکان، این را با کلید anon جایگزین کنید
+                "sb_publishable_FjLySgXMkBzoxfG2RTh3vg_NYavRF-0"
             );
         }
     } catch (e) { console.error("خطا در اتصال به سرور:", e); }
@@ -34,7 +34,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     let peerConnections = {}; 
     let viewerConnection = null;
-    
     let currentRoom;
     let currentUser;
     let isHost = false;
@@ -42,10 +41,10 @@ document.addEventListener('DOMContentLoaded', () => {
     let roomChannel;
     let isStreaming = false;
     let pendingCandidates = {}; 
-    let reconnectTimeout;
-    let presenceId = Math.random().toString(36).substr(2, 9); // برای جلوگیری از تداخل اسم‌ها
+    let requestTimer = null;
+    let presenceKey = "";
+    let lastChatTime = 0;
 
-    // ارتقای تنظیمات ICE با پشتیبانی از TURNS (برای شبکه‌های سخت گیر)
     const config = {
         iceServers: [
             { urls: 'stun:stun.l.google.com:19302' },
@@ -54,18 +53,23 @@ document.addEventListener('DOMContentLoaded', () => {
             { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
             { urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
         ],
-        iceCandidatePoolSize: 10
+        iceCandidatePoolSize: 10,
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require'
     };
+
+    // 1. همگام‌سازی دکمه تمام صفحه با کلید ESC
+    document.addEventListener('fullscreenchange', () => {
+        if (btnFullscreen) btnFullscreen.innerText = document.fullscreenElement ? "✖" : "⛶";
+    });
 
     if (btnFullscreen) {
         btnFullscreen.addEventListener('click', () => {
             const videoContainer = document.getElementById('video-container');
             if (!document.fullscreenElement) {
                 if (videoContainer.requestFullscreen) videoContainer.requestFullscreen();
-                btnFullscreen.innerText = "✖";
             } else {
                 if (document.exitFullscreen) document.exitFullscreen();
-                btnFullscreen.innerText = "⛶";
             }
         });
     }
@@ -90,11 +94,20 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btnJoin) btnJoin.addEventListener('click', () => joinRoom(false));
     
     if (btnLeave) btnLeave.addEventListener('click', () => {
+        // پاکسازی کامل اتصالات و ترک‌ها
+        if (remoteVideo.srcObject) remoteVideo.srcObject.getTracks().forEach(t => t.stop());
         Object.values(peerConnections).forEach(pc => pc.close());
         if (viewerConnection) viewerConnection.close();
         if (roomChannel && dbClient) dbClient.removeChannel(roomChannel);
         if (localStream) localStream.getTracks().forEach(track => track.stop());
         location.reload();
+    });
+
+    // 3. مدیریت خروج کاربر (beforeunload)
+    window.addEventListener('beforeunload', () => {
+        if (roomChannel) {
+            roomChannel.send({ type: 'broadcast', event: 'user-left', payload: { user: currentUser } });
+        }
     });
 
     if (btnSend && chatInput) {
@@ -111,6 +124,23 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // 2. تابع درخواست استریم با تلاش مجدد
+    function requestStreamWithRetry() {
+        if (isHost) return;
+        clearInterval(requestTimer);
+        let tries = 0;
+        const tick = () => {
+            if (viewerConnection && ['connected', 'connecting'].includes(viewerConnection.connectionState)) {
+                clearInterval(requestTimer);
+                return;
+            }
+            if (tries++ > 15) { clearInterval(requestTimer); return; } 
+            if (roomChannel) roomChannel.send({ type: 'broadcast', event: 'request-stream', payload: { from: currentUser } });
+        };
+        tick();
+        requestTimer = setInterval(tick, 4000);
+    }
+
     async function joinRoom(hostMode) {
         const usernameInput = document.getElementById('username');
         const roomInput = document.getElementById('room-id');
@@ -123,70 +153,83 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!dbClient) return alert("اتصال به سرور برقرار نیست.");
         
         isHost = hostMode;
+        presenceKey = `${currentUser}_${Math.random().toString(36).slice(2, 8)}`; // کلید یکتا
+
         loginView.classList.remove('active');
         roomView.classList.add('active');
         document.getElementById('room-name').innerText = `اتاق: ${currentRoom}`;
         setStatus("در حال اتصال به سرور...", "#f59e0b");
 
         roomChannel = dbClient.channel(`room_${currentRoom}`, {
-            config: { presence: { key: `${currentUser}_${presenceId}` } } // کلید یکتا
+            config: { presence: { key: presenceKey } }
         });
         
         roomChannel
             .on('broadcast', { event: 'chat' }, (payload) => appendChat(payload.payload.user, payload.payload.text))
             .on('broadcast', { event: 'reaction' }, (payload) => showFloatingEmoji(payload.emoji))
             
-            // **حل باگ مهم**: گوش دادن به رویداد شروع پخش توسط بیننده
+            // 4. حل باگ ورود زودهنگام و تغییر فیلم
             .on('broadcast', { event: 'stream-started' }, () => {
-                if (!isHost && !remoteVideo.srcObject) {
-                    console.log("Host started streaming. Sending request...");
-                    roomChannel.send({ type: 'broadcast', event: 'request-stream', payload: { from: currentUser } });
-                }
+                if (!isHost) requestStreamWithRetry();
+            })
+            .on('broadcast', { event: 'stream-restarted' }, () => {
+                if (!isHost) requestStreamWithRetry();
             })
             
             .on('broadcast', { event: 'webrtc-offer' }, async (payload) => {
-                if (!isHost && payload.to === currentUser) {
-                    handleViewerOffer(payload);
-                }
+                if (!isHost && payload.to === currentUser) handleViewerOffer(payload);
             })
             .on('broadcast', { event: 'webrtc-answer' }, async (payload) => {
-                if (isHost && payload.to === currentUser) {
-                    handleHostAnswer(payload);
-                }
+                if (isHost && payload.to === currentUser) handleHostAnswer(payload);
             })
             .on('broadcast', { event: 'webrtc-ice' }, async (payload) => {
-                if (payload.to === currentUser) {
-                    handleIceCandidate(payload);
-                }
+                if (payload.to === currentUser) handleIceCandidate(payload);
             })
             .on('broadcast', { event: 'request-stream' }, (payload) => {
-                if (isHost && isStreaming) {
-                    createOfferForViewer(payload.from);
+                if (isHost && isStreaming) createOfferForViewer(payload.from);
+            })
+            .on('broadcast', { event: 'user-left' }, (payload) => {
+                if (isHost && peerConnections[payload.user]) {
+                    peerConnections[payload.user].close();
+                    delete peerConnections[payload.user];
                 }
+            })
+            // 5. مدیریت خروج با Presence
+            .on('presence', { event: 'leave' }, ({ leftPresences }) => {
+                leftPresences.forEach(p => {
+                    if (isHost && peerConnections[p.user]) {
+                        peerConnections[p.user].close();
+                        delete peerConnections[p.user];
+                    }
+                });
             })
             .on('presence', { event: 'sync' }, () => {
                 const state = roomChannel.presenceState();
-                // شمارش کاربران با توجه به کلیدهای یکتا
-                const userCount = Object.keys(state).length;
-                onlineUsersText.innerText = `👥 ${userCount} نفر آنلاین`;
+                // حل مشکل شمارش آنلاین (استفاده از Set)
+                const users = new Set();
+                Object.values(state).forEach(arr => arr.forEach(p => users.add(p.user)));
+                onlineUsersText.innerText = `👥 ${users.size} نفر آنلاین`;
             })
-            .subscribe(async (status, err) => {
-                console.log("Realtime Status:", status, err);
+            // 6. مدیریت قطعی کانال سوپابیس
+            .subscribe(async (status) => {
                 if (status === 'SUBSCRIBED') {
                     await roomChannel.track({ user: currentUser, online_at: new Date().toISOString() });
-
                     if (isHost) {
                         document.getElementById('host-controls').style.display = 'flex';
                         setStatus("آماده پخش", "#10b981");
                         setupHost();
                     } else {
                         waitingText.style.display = 'block';
-                        waitingText.innerText = "در حال اتصال به سینما...";
-                        setStatus("در حال اتصال", "#f59e0b");
-                        
-                        // درخواست اولیه
-                        roomChannel.send({ type: 'broadcast', event: 'request-stream', payload: { from: currentUser } });
+                        waitingText.innerText = "در انتظار شروع پخش...";
+                        setStatus("در انتظار پخش", "#f59e0b");
+                        requestStreamWithRetry(); // فراخوانی تابع جدید
                     }
+                } else if (['CHANNEL_ERROR', 'TIMED_OUT', 'CLOSED'].includes(status)) {
+                    setStatus('اتصال قطع شد، تلاش مجدد...', '#ef4444');
+                    setTimeout(() => {
+                        if (dbClient) dbClient.removeChannel(roomChannel);
+                        joinRoom(isHost);
+                    }, 3000);
                 }
             });
     }
@@ -210,7 +253,13 @@ document.addEventListener('DOMContentLoaded', () => {
     function sendChat() {
         if (!chatInput) return;
         const text = chatInput.value.trim();
+        const now = Date.now();
+        // 7. محدودیت طول و نرخ ارسال پیام
+        if (now - lastChatTime < 500) return; 
+        if (text.length > 300) return alert("پیام بیش از حد طولانی است.");
+        
         if (text && roomChannel) {
+            lastChatTime = now;
             roomChannel.send({ type: 'broadcast', event: 'chat', payload: { user: currentUser, text: text } });
             appendChat(currentUser + " (شما)", text);
             chatInput.value = '';
@@ -218,7 +267,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // **حل مشکل امنیتی XSS**: استفاده از textContent به جای innerHTML
+    // 8. بستن XSS در چت (استفاده از textContent)
     function appendChat(user, text) {
         if (!chatMessages) return;
         const msgDiv = document.createElement('div');
@@ -236,10 +285,11 @@ document.addEventListener('DOMContentLoaded', () => {
         chatMessages.scrollTo({ top: chatMessages.scrollHeight, behavior: 'smooth' });
     }
 
+    // 9. تنظیم بیت‌ریت واقع‌بینانه
     function getCinemaConstraints() {
         const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-        if (isMobile) return { width: 1280, height: 720, frameRate: 30, bitrate: 1500000 }; 
-        else return { width: 1920, height: 1080, frameRate: 30, bitrate: 2500000 }; 
+        if (isMobile) return { width: 854, height: 480, frameRate: 30, bitrate: 1200000 }; // 1.2Mbps
+        else return { width: 1280, height: 720, frameRate: 30, bitrate: 1800000 }; // 1.8Mbps
     }
 
     function setupHost() {
@@ -270,6 +320,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         btnStartStream.addEventListener('click', async () => {
             try {
+                // 10. بررسی پشتیبانی مرورگر (مخصوصاً iOS)
+                if (!localVideo.captureStream && !localVideo.mozCaptureStream) {
+                    alert('مرورگر شما از پخش فایل پشتیبانی نمی‌کند. لطفاً از Chrome یا Firefox استفاده کنید.');
+                    return;
+                }
+
                 btnStartStream.innerText = "⏳ در حال آماده‌سازی...";
                 await localVideo.play();
                 
@@ -280,8 +336,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 btnStartStream.innerText = `🟢 در حال پخش`;
                 btnStartStream.disabled = true;
                 
-                // **اطلاع دادن به همه که استریم شروع شد**
                 roomChannel.send({ type: 'broadcast', event: 'stream-started', payload: {} });
+                roomChannel.send({ type: 'broadcast', event: 'stream-restarted', payload: {} });
 
             } catch (err) {
                 alert("خطا در شروع پخش: " + err.message);
@@ -290,35 +346,22 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    async function createOfferForViewer(viewerId) {
+    async function createOfferForViewer(viewerId, iceRestart = false) {
         if (peerConnections[viewerId]) {
             peerConnections[viewerId].close();
         }
 
         const pc = new RTCPeerConnection(config);
         peerConnections[viewerId] = pc;
-        pendingCandidates[viewerId] = [];
+        pendingCandidates[viewerId] = []; // پاکسازی کاندیدهای قدیمی
 
-        localStream.getTracks().forEach(track => {
-            const sender = pc.addTrack(track, localStream);
-            if (track.kind === 'video') {
-                const params = sender.getParameters();
-                if (!params.encodings) params.encodings = [{}];
-                
-                // **بهینه‌سازی رزولوشن و بیت‌ریت**
-                params.encodings[0].maxBitrate = getCinemaConstraints().bitrate;
-                params.encodings[0].scaleResolutionDownBy = 1.0; 
-                params.degradationPreference = 'maintain-framerate';
-                
-                sender.setParameters(params).catch(e => console.warn(e));
-            }
-        });
+        localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
-        // **مدیریت وضعیت اتصال (Reconnect)**
+        // 11. مدیریت قطعی و ICE Restart
         pc.onconnectionstatechange = () => {
             if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                 console.warn(`Connection to ${viewerId} lost. Restarting ICE...`);
-                pc.restartIce();
+                createOfferForViewer(viewerId, true); 
             }
         };
 
@@ -328,8 +371,19 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         };
 
-        const offer = await pc.createOffer();
+        const offer = await pc.createOffer({ iceRestart });
         await pc.setLocalDescription(offer);
+        
+        // 12. انتقال تنظیمات بیت‌ریت به بعد از SLD
+        for (const sender of pc.getSenders()) {
+            if (sender.track?.kind !== 'video') continue;
+            const params = sender.getParameters();
+            if (!params.encodings?.length) params.encodings = [{}];
+            params.encodings[0].maxBitrate = getCinemaConstraints().bitrate;
+            params.degradationPreference = 'maintain-framerate';
+            await sender.setParameters(params).catch(console.warn);
+        }
+
         roomChannel.send({ type: 'broadcast', event: 'webrtc-offer', payload: { sdp: offer, from: currentUser, to: viewerId } });
     }
 
@@ -355,12 +409,12 @@ document.addEventListener('DOMContentLoaded', () => {
         if (remoteVideo.srcObject) remoteVideo.srcObject = null;
 
         viewerConnection = new RTCPeerConnection(config);
-        pendingCandidates['viewer'] = [];
+        pendingCandidates['viewer'] = []; // پاکسازی
 
         viewerConnection.onconnectionstatechange = () => {
             if (viewerConnection.connectionState === 'failed' || viewerConnection.connectionState === 'disconnected') {
                 setStatus("بازیابی ارتباط...", "#ef4444");
-                roomChannel.send({ type: 'broadcast', event: 'request-stream', payload: { from: currentUser } });
+                requestStreamWithRetry();
             }
         };
 
@@ -378,6 +432,7 @@ document.addEventListener('DOMContentLoaded', () => {
             localVideo.style.display = 'none';
             waitingText.style.display = 'none';
             setStatus("در حال پخش", "#10b981");
+            clearInterval(requestTimer);
             
             remoteVideo.muted = true;
             remoteVideo.play().catch(e => {
