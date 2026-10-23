@@ -43,7 +43,6 @@ document.addEventListener('DOMContentLoaded', () => {
     let pendingCandidates = {}; 
     let requestTimer = null;
     let presenceKey = "";
-    let lastChatTime = 0;
 
     const config = {
         iceServers: [
@@ -53,12 +52,9 @@ document.addEventListener('DOMContentLoaded', () => {
             { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
             { urls: 'turns:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' }
         ],
-        iceCandidatePoolSize: 10,
-        bundlePolicy: 'max-bundle',
-        rtcpMuxPolicy: 'require'
+        iceCandidatePoolSize: 10
     };
 
-    // 1. همگام‌سازی دکمه تمام صفحه با کلید ESC
     document.addEventListener('fullscreenchange', () => {
         if (btnFullscreen) btnFullscreen.innerText = document.fullscreenElement ? "✖" : "⛶";
     });
@@ -94,7 +90,6 @@ document.addEventListener('DOMContentLoaded', () => {
     if (btnJoin) btnJoin.addEventListener('click', () => joinRoom(false));
     
     if (btnLeave) btnLeave.addEventListener('click', () => {
-        // پاکسازی کامل اتصالات و ترک‌ها
         if (remoteVideo.srcObject) remoteVideo.srcObject.getTracks().forEach(t => t.stop());
         Object.values(peerConnections).forEach(pc => pc.close());
         if (viewerConnection) viewerConnection.close();
@@ -103,11 +98,8 @@ document.addEventListener('DOMContentLoaded', () => {
         location.reload();
     });
 
-    // 3. مدیریت خروج کاربر (beforeunload)
     window.addEventListener('beforeunload', () => {
-        if (roomChannel) {
-            roomChannel.send({ type: 'broadcast', event: 'user-left', payload: { user: currentUser } });
-        }
+        if (roomChannel) roomChannel.send({ type: 'broadcast', event: 'user-left', payload: { user: currentUser } });
     });
 
     if (btnSend && chatInput) {
@@ -124,7 +116,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // 2. تابع درخواست استریم با تلاش مجدد
     function requestStreamWithRetry() {
         if (isHost) return;
         clearInterval(requestTimer);
@@ -153,7 +144,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!dbClient) return alert("اتصال به سرور برقرار نیست.");
         
         isHost = hostMode;
-        presenceKey = `${currentUser}_${Math.random().toString(36).slice(2, 8)}`; // کلید یکتا
+        presenceKey = `${currentUser}_${Math.random().toString(36).slice(2, 8)}`;
 
         loginView.classList.remove('active');
         roomView.classList.add('active');
@@ -167,15 +158,8 @@ document.addEventListener('DOMContentLoaded', () => {
         roomChannel
             .on('broadcast', { event: 'chat' }, (payload) => appendChat(payload.payload.user, payload.payload.text))
             .on('broadcast', { event: 'reaction' }, (payload) => showFloatingEmoji(payload.emoji))
-            
-            // 4. حل باگ ورود زودهنگام و تغییر فیلم
-            .on('broadcast', { event: 'stream-started' }, () => {
-                if (!isHost) requestStreamWithRetry();
-            })
-            .on('broadcast', { event: 'stream-restarted' }, () => {
-                if (!isHost) requestStreamWithRetry();
-            })
-            
+            .on('broadcast', { event: 'stream-started' }, () => { if (!isHost) requestStreamWithRetry(); })
+            .on('broadcast', { event: 'stream-restarted' }, () => { if (!isHost) requestStreamWithRetry(); })
             .on('broadcast', { event: 'webrtc-offer' }, async (payload) => {
                 if (!isHost && payload.to === currentUser) handleViewerOffer(payload);
             })
@@ -194,7 +178,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     delete peerConnections[payload.user];
                 }
             })
-            // 5. مدیریت خروج با Presence
             .on('presence', { event: 'leave' }, ({ leftPresences }) => {
                 leftPresences.forEach(p => {
                     if (isHost && peerConnections[p.user]) {
@@ -205,12 +188,10 @@ document.addEventListener('DOMContentLoaded', () => {
             })
             .on('presence', { event: 'sync' }, () => {
                 const state = roomChannel.presenceState();
-                // حل مشکل شمارش آنلاین (استفاده از Set)
                 const users = new Set();
                 Object.values(state).forEach(arr => arr.forEach(p => users.add(p.user)));
                 onlineUsersText.innerText = `👥 ${users.size} نفر آنلاین`;
             })
-            // 6. مدیریت قطعی کانال سوپابیس
             .subscribe(async (status) => {
                 if (status === 'SUBSCRIBED') {
                     await roomChannel.track({ user: currentUser, online_at: new Date().toISOString() });
@@ -222,14 +203,11 @@ document.addEventListener('DOMContentLoaded', () => {
                         waitingText.style.display = 'block';
                         waitingText.innerText = "در انتظار شروع پخش...";
                         setStatus("در انتظار پخش", "#f59e0b");
-                        requestStreamWithRetry(); // فراخوانی تابع جدید
+                        requestStreamWithRetry();
                     }
                 } else if (['CHANNEL_ERROR', 'TIMED_OUT', 'CLOSED'].includes(status)) {
                     setStatus('اتصال قطع شد، تلاش مجدد...', '#ef4444');
-                    setTimeout(() => {
-                        if (dbClient) dbClient.removeChannel(roomChannel);
-                        joinRoom(isHost);
-                    }, 3000);
+                    setTimeout(() => { if (dbClient) dbClient.removeChannel(roomChannel); joinRoom(isHost); }, 3000);
                 }
             });
     }
@@ -253,13 +231,8 @@ document.addEventListener('DOMContentLoaded', () => {
     function sendChat() {
         if (!chatInput) return;
         const text = chatInput.value.trim();
-        const now = Date.now();
-        // 7. محدودیت طول و نرخ ارسال پیام
-        if (now - lastChatTime < 500) return; 
         if (text.length > 300) return alert("پیام بیش از حد طولانی است.");
-        
         if (text && roomChannel) {
-            lastChatTime = now;
             roomChannel.send({ type: 'broadcast', event: 'chat', payload: { user: currentUser, text: text } });
             appendChat(currentUser + " (شما)", text);
             chatInput.value = '';
@@ -267,29 +240,24 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
-    // 8. بستن XSS در چت (استفاده از textContent)
     function appendChat(user, text) {
         if (!chatMessages) return;
         const msgDiv = document.createElement('div');
         msgDiv.className = 'msg';
-        
         const nameSpan = document.createElement('span');
         nameSpan.className = 'name';
         nameSpan.textContent = user;
-        
         const textNode = document.createTextNode(text);
-        
         msgDiv.appendChild(nameSpan);
         msgDiv.appendChild(textNode);
         chatMessages.appendChild(msgDiv);
         chatMessages.scrollTo({ top: chatMessages.scrollHeight, behavior: 'smooth' });
     }
 
-    // 9. تنظیم بیت‌ریت واقع‌بینانه
     function getCinemaConstraints() {
         const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
-        if (isMobile) return { width: 854, height: 480, frameRate: 30, bitrate: 1200000 }; // 1.2Mbps
-        else return { width: 1280, height: 720, frameRate: 30, bitrate: 1800000 }; // 1.8Mbps
+        if (isMobile) return { width: 854, height: 480, frameRate: 30, bitrate: 1200000 }; 
+        else return { width: 1280, height: 720, frameRate: 30, bitrate: 1800000 }; 
     }
 
     function setupHost() {
@@ -300,7 +268,6 @@ document.addEventListener('DOMContentLoaded', () => {
             if (file) {
                 Object.values(peerConnections).forEach(pc => pc.close());
                 peerConnections = {};
-
                 if (localStream) localStream.getTracks().forEach(track => track.stop());
                 isStreaming = false;
 
@@ -320,7 +287,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
         btnStartStream.addEventListener('click', async () => {
             try {
-                // 10. بررسی پشتیبانی مرورگر (مخصوصاً iOS)
                 if (!localVideo.captureStream && !localVideo.mozCaptureStream) {
                     alert('مرورگر شما از پخش فایل پشتیبانی نمی‌کند. لطفاً از Chrome یا Firefox استفاده کنید.');
                     return;
@@ -347,17 +313,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     async function createOfferForViewer(viewerId, iceRestart = false) {
-        if (peerConnections[viewerId]) {
-            peerConnections[viewerId].close();
-        }
+        if (peerConnections[viewerId]) peerConnections[viewerId].close();
 
         const pc = new RTCPeerConnection(config);
         peerConnections[viewerId] = pc;
-        pendingCandidates[viewerId] = []; // پاکسازی کاندیدهای قدیمی
+        pendingCandidates[viewerId] = []; 
 
         localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
 
-        // 11. مدیریت قطعی و ICE Restart
         pc.onconnectionstatechange = () => {
             if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
                 console.warn(`Connection to ${viewerId} lost. Restarting ICE...`);
@@ -374,7 +337,6 @@ document.addEventListener('DOMContentLoaded', () => {
         const offer = await pc.createOffer({ iceRestart });
         await pc.setLocalDescription(offer);
         
-        // 12. انتقال تنظیمات بیت‌ریت به بعد از SLD
         for (const sender of pc.getSenders()) {
             if (sender.track?.kind !== 'video') continue;
             const params = sender.getParameters();
@@ -390,7 +352,6 @@ document.addEventListener('DOMContentLoaded', () => {
     async function handleHostAnswer(payload) {
         const viewerId = payload.from;
         const pc = peerConnections[viewerId];
-        
         if (pc && pc.signalingState === 'have-local-offer') {
             try {
                 await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
@@ -409,7 +370,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (remoteVideo.srcObject) remoteVideo.srcObject = null;
 
         viewerConnection = new RTCPeerConnection(config);
-        pendingCandidates['viewer'] = []; // پاکسازی
+        pendingCandidates['viewer'] = []; 
 
         viewerConnection.onconnectionstatechange = () => {
             if (viewerConnection.connectionState === 'failed' || viewerConnection.connectionState === 'disconnected') {
@@ -425,9 +386,7 @@ document.addEventListener('DOMContentLoaded', () => {
         };
 
         viewerConnection.ontrack = event => {
-            if (remoteVideo.srcObject !== event.streams[0]) {
-                remoteVideo.srcObject = event.streams[0];
-            }
+            if (remoteVideo.srcObject !== event.streams[0]) remoteVideo.srcObject = event.streams[0];
             remoteVideo.style.display = 'block'; 
             localVideo.style.display = 'none';
             waitingText.style.display = 'none';
